@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lila-hub"
+version = "1.0.0"
+description = "Plug-and-Play Connector Board for TicketLabs Standalone Packages (lila-asi, lila-capability-engine, lila-vtalks, lila-oia)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "AGPL-3.0-only"}
+authors = [{name = "TicketLabs (Harboria Labs)"}]
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
