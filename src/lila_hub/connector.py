@@ -306,6 +306,7 @@ class LilaHub:
 
     def connect(self) -> ConnectedComponents:
         """Auto-discover and wire all installed or downloaded TicketLabs standalone packages."""
+        self.close()
         _auto_extend_sys_path(self.search_dirs)
         resolved_model = _auto_find_asi_model(self.asi_model_path)
         if resolved_model:
