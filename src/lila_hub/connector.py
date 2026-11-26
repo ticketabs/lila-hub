@@ -1,17 +1,20 @@
 """
-LilaHub Connector Board — auto-discovers and wires TicketLabs standalone modules together.
+LilaHub Connector Board — auto-discovers and wires TicketLabs standalone modules,
+zero-pip drop-in `plugins/` manifests, and optional CapabilityProviders together.
 Works with 1 module, 2 modules, or all public modules installed.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import importlib
+import importlib.metadata
 import json
 import os
 from pathlib import Path
 import ssl
 import sys
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 import urllib.error
 import urllib.request
 
@@ -130,13 +133,14 @@ def _auto_extend_sys_path(extra_search_dirs: Optional[Sequence[str | Path]] = No
                 candidates.append(Path(part.strip()).expanduser())
 
     here = Path(__file__).resolve().parent
-    # Relative to lila_hub/connector.py (e.g. inside dist/lila-hub/src/lila_hub)
-    for root in [*list(here.parents)[2:4],
+    roots = [
+        *list(here.parents)[1:5],
         Path.cwd(),
         Path.cwd() / "dist",
         Path.home() / "ticketlabs",
         Path.home() / ".local" / "share" / "lila" / "packages",
-    ]:
+    ]
+    for root in roots:
         if not root.is_dir():
             continue
         candidates.extend([
@@ -146,6 +150,7 @@ def _auto_extend_sys_path(extra_search_dirs: Optional[Sequence[str | Path]] = No
             root / "lila-capability-engine" / "src",
             root / "lila-vtalks" / "src",
             root / "lila-oia" / "src",
+            root / "lila-sensa" / "src",
         ])
 
     added: List[str] = []
@@ -160,14 +165,62 @@ def _auto_extend_sys_path(extra_search_dirs: Optional[Sequence[str | Path]] = No
     return added
 
 
+def _discover_plugin_dirs(extra_plugin_dirs: Optional[Sequence[str | Path]] = None) -> List[Path]:
+    """Locate existing drop-in `plugins/` directories for zero-pip manifest scanning."""
+    raw_candidates: List[Path] = []
+    if extra_plugin_dirs:
+        for d in extra_plugin_dirs:
+            if d:
+                raw_candidates.append(Path(d).expanduser())
+
+    env_plugins = os.environ.get("LILA_PLUGINS_DIR", "").strip()
+    if env_plugins:
+        for part in env_plugins.split(os.pathsep):
+            if part.strip():
+                raw_candidates.append(Path(part.strip()).expanduser())
+
+    here = Path(__file__).resolve().parent
+    for parent in list(here.parents)[1:6]:
+        raw_candidates.append(parent / "plugins")
+
+    raw_candidates.extend([
+        Path.cwd() / "plugins",
+        Path.cwd().parent / "plugins",
+        Path.home() / ".local" / "share" / "lila" / "plugins",
+    ])
+
+    unique: List[Path] = []
+    seen: set[str] = set()
+    for cand in raw_candidates:
+        try:
+            resolved = cand.resolve()
+        except OSError:
+            continue
+        key = str(resolved)
+        if resolved.is_dir() and key not in seen:
+            seen.add(key)
+            unique.append(resolved)
+    return unique
+
+
+def _load_dotted_symbol(spec: str) -> Any:
+    """Import and return attribute denoted by `'module.path:attr'`."""
+    clean = str(spec or "").strip()
+    if ":" not in clean:
+        raise ValueError(f"Expected 'module:attribute' spec, got {spec!r}")
+    mod_name, attr_path = clean.split(":", 1)
+    obj: Any = importlib.import_module(mod_name.strip())
+    for part in attr_path.strip().split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
 def _auto_find_asi_model(explicit_path: Optional[str] = None) -> Optional[str]:
     """Locate an .asi cartridge from an explicit path, LILA_ASI_PATH, or standard device folders."""
-    search_files: List[Path] = []
     if explicit_path:
         p = Path(explicit_path).expanduser()
         if p.is_file():
             return str(p.resolve())
-        search_files.append(p)
 
     env_model = os.environ.get("LILA_ASI_PATH", "").strip()
     if env_model:
@@ -199,6 +252,32 @@ def _auto_find_asi_model(explicit_path: Optional[str] = None) -> Optional[str]:
     return explicit_path
 
 
+def _is_env_disabled(name: str, default_enabled: bool = True) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return not default_enabled
+    return raw.strip().lower() in {"0", "false", "off", "no"}
+
+
+def _invoke_provider_factory(
+    factory: Any,
+    *,
+    capability_engine: Any,
+    tool_registry: Optional[Any],
+    state_root: Optional[Path],
+) -> Any:
+    if not callable(factory):
+        return factory
+    try:
+        return factory(
+            capability_engine=capability_engine,
+            tool_registry=tool_registry,
+            state_root=state_root,
+        )
+    except TypeError:
+        return factory()
+
+
 @dataclass
 class ConnectedComponents:
     asi_runtime: Optional[Any] = None
@@ -207,7 +286,11 @@ class ConnectedComponents:
     harness_capability_adapter: Optional[Any] = None
     voice_transcriber: Optional[Any] = None
     owner_auth_service: Optional[Any] = None
+    sensa_cls: Optional[Any] = None
     discovered_modules: List[str] = field(default_factory=list)
+    attached_providers: Dict[str, Any] = field(default_factory=dict)
+    provider_registrations: Dict[str, Any] = field(default_factory=dict)
+    provider_errors: Dict[str, str] = field(default_factory=dict)
 
 
 class LilaHub:
@@ -230,23 +313,27 @@ class LilaHub:
         n_ctx: int = 8192,
         n_threads: int = 2,
         asi_mode: str = "fast",
+        load_asi: bool = True,
         custom_llm_fn: Optional[Callable[[List[Dict[str, str]]], str]] = None,
         remote_url: Optional[str] = None,
         remote_api_token: Optional[str] = None,
         prefer_remote: bool = False,
         session_id: str = "hub-default",
         search_dirs: Optional[Sequence[str | Path]] = None,
+        plugin_dirs: Optional[Sequence[str | Path]] = None,
     ) -> None:
         self.asi_model_path = asi_model_path
         self.n_ctx = n_ctx
         self.n_threads = n_threads
         self.asi_mode = asi_mode
+        self.load_asi = bool(load_asi)
         self.custom_llm_fn = custom_llm_fn
         self.remote_url = remote_url
         self.remote_api_token = remote_api_token
         self.prefer_remote = prefer_remote
         self.session_id = session_id
         self.search_dirs = list(search_dirs) if search_dirs else []
+        self.plugin_dirs = list(plugin_dirs) if plugin_dirs else []
         self.components = ConnectedComponents()
         self.remote_client: Optional[LilaRemoteClient] = (
             LilaRemoteClient(remote_url, api_token=remote_api_token)
@@ -256,6 +343,15 @@ class LilaHub:
         self.edge_nodes: Dict[str, EdgeDeviceNode] = {}
         self._tools: Dict[str, Any] = {}
         self._history: List[Dict[str, str]] = []
+        self._provider_factories: Dict[str, Callable[..., Any]] = {}
+        self._provider_detach_hooks: Dict[str, Callable[..., Any]] = {}
+
+    def register_provider_factory(self, name: str, factory: Callable[..., Any]) -> None:
+        """Register an additional custom CapabilityProvider factory for auto-attachment."""
+        clean = str(name or "").strip()
+        if not clean:
+            raise ValueError("Provider factory name must not be empty.")
+        self._provider_factories[clean] = factory
 
     def register_edge_node(self, node: EdgeDeviceNode) -> None:
         """
@@ -298,17 +394,38 @@ class LilaHub:
     def register_tool(self, tool_obj: Any) -> None:
         """Register a tool object (with .name, .args, .execute) on the connector board."""
         self._tools[tool_obj.name] = tool_obj
-        if self.components.capability_engine is not None:
+        eng = self.components.capability_engine
+        if eng is not None and hasattr(eng, "catalog"):
             try:
-                self.components.capability_engine.catalog.register_callable_tool(tool_obj)
+                try:
+                    from capability_engine.models import ToolDescriptor
+                except ImportError:
+                    from src.capability_engine.models import ToolDescriptor
+                schema_fn = getattr(tool_obj, "as_prompt_description", None)
+                schema_text = (
+                    schema_fn()
+                    if callable(schema_fn)
+                    else f"{tool_obj.name}(): {getattr(tool_obj, 'description', '')}"
+                )
+                desc = ToolDescriptor(
+                    name=str(tool_obj.name),
+                    capability_id=f"tool.{tool_obj.name}",
+                    category=str(getattr(tool_obj, "category", "hub") or "hub"),
+                    summary=str(getattr(tool_obj, "description", "")),
+                    risk=str(getattr(tool_obj, "risk", "moderate") or "moderate"),
+                    permission_hint=str(getattr(tool_obj, "permission", "auto") or "auto"),
+                    estimated_schema_tokens=0,
+                    schema_text=schema_text,
+                )
+                eng.catalog.register_tool_descriptor(desc, actor="lila_hub")
             except Exception:
                 pass
 
-    def connect(self) -> ConnectedComponents:
+    def connect(self, *, capability_engine: Optional[Any] = None) -> ConnectedComponents:
         """Auto-discover and wire all installed or downloaded TicketLabs standalone packages."""
         self.close()
         _auto_extend_sys_path(self.search_dirs)
-        resolved_model = _auto_find_asi_model(self.asi_model_path)
+        resolved_model = _auto_find_asi_model(self.asi_model_path) if self.load_asi else self.asi_model_path
         if resolved_model:
             self.asi_model_path = resolved_model
         c = ConnectedComponents()
@@ -329,8 +446,11 @@ class LilaHub:
                     HarnessCapabilityAdapter,
                     register_builtin_capabilities,
                 )
-            eng = CapabilityEngine()
-            register_builtin_capabilities(eng.skills, eng.catalog)
+            if capability_engine is not None:
+                eng = capability_engine
+            else:
+                eng = CapabilityEngine()
+                register_builtin_capabilities(eng.skills, eng.catalog)
             c.capability_engine = eng
             c.core_capability_adapter = CoreCapabilityAdapter(eng)
             c.harness_capability_adapter = HarnessCapabilityAdapter(eng, strict_enforcement=True)
@@ -344,9 +464,10 @@ class LilaHub:
                 from lila_asi import AsiRuntime, apply_asi_mode_preset
             except ImportError:
                 from src.core.asi_backend import AsiRuntime, apply_asi_mode_preset
-            apply_asi_mode_preset(self.asi_mode)
+            if self.load_asi:
+                apply_asi_mode_preset(self.asi_mode)
             c.discovered_modules.append("lila-asi")
-            if self.asi_model_path and Path(self.asi_model_path).is_file():
+            if self.load_asi and self.asi_model_path and Path(self.asi_model_path).is_file():
                 c.asi_runtime = AsiRuntime(
                     self.asi_model_path,
                     n_ctx=self.n_ctx,
@@ -369,23 +490,281 @@ class LilaHub:
         # 4. Discover & wire lila-oia
         try:
             try:
-                from oia import OwnerAuthenticationService, OwnerProfileStore
+                from oia.service import OwnerAuthenticationService, OwnerProfileStore
             except ImportError:
-                from src.oia import OwnerAuthenticationService, OwnerProfileStore
+                from src.oia.service import OwnerAuthenticationService, OwnerProfileStore
             c.owner_auth_service = (OwnerAuthenticationService, OwnerProfileStore)
             c.discovered_modules.append("lila-oia")
+        except ImportError:
+            pass
+
+        # 5. Discover lila-sensa (Media Intelligence)
+        try:
+            try:
+                from sensa import Sensa
+            except ImportError:
+                from src.sensa import Sensa
+            c.sensa_cls = Sensa
+            c.discovered_modules.append("lila-sensa")
         except ImportError:
             pass
 
         self.components = c
         return c
 
+    def _register_if_provider(
+        self,
+        eng: Any,
+        name: str,
+        candidate: Any,
+        *,
+        tool_registry: Optional[Any],
+        allow_auto_activate: bool,
+        actor: str,
+    ) -> None:
+        if candidate is None:
+            return
+        if not (hasattr(candidate, "describe_skills") and hasattr(candidate, "describe_bundles")):
+            return
+        pid = str(getattr(candidate, "provider_id", "") or name).strip() or name
+        existing = {p.provider_id for p in eng.providers.list_providers()}
+        if pid not in existing:
+            reg = eng.providers.register_provider(
+                candidate,
+                tool_registry=tool_registry,
+                allow_auto_activate=allow_auto_activate,
+                actor=actor,
+            )
+            self.components.provider_registrations[pid] = reg
+        self.components.attached_providers[pid] = candidate
+
+    def _attach_drop_in_plugins(
+        self,
+        eng: Any,
+        *,
+        tool_registry: Optional[Any],
+        base_state: Path,
+        allow_auto_activate: bool,
+        actor: str,
+    ) -> None:
+        """Scan drop-in `plugins/<name>/lila_plugin.json` folders without requiring pip install."""
+        c = self.components
+        for pdir in _discover_plugin_dirs(self.plugin_dirs):
+            try:
+                children = sorted(pdir.iterdir(), key=lambda p: p.name)
+            except OSError:
+                continue
+            for folder in children:
+                if not folder.is_dir():
+                    continue
+                manifest_path = folder / "lila_plugin.json"
+                if not manifest_path.is_file():
+                    continue
+                pid = folder.name
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    pid = str(manifest.get("provider_id") or folder.name).strip() or folder.name
+                    if pid in c.attached_providers:
+                        continue
+                    enabled_env = str(manifest.get("enabled_env") or "").strip()
+                    if enabled_env and _is_env_disabled(enabled_env, default_enabled=True):
+                        continue
+                    if manifest.get("requires_tool_registry") and tool_registry is None:
+                        continue
+
+                    py_paths = manifest.get("python_paths") or [".", "src"]
+                    for rel in reversed(list(py_paths)):
+                        cand = (folder / str(rel)).resolve()
+                        if cand.is_dir():
+                            s = str(cand)
+                            if s not in sys.path:
+                                sys.path.insert(0, s)
+
+                    factory = _load_dotted_symbol(str(manifest["factory"]))
+                    ws_subpath = str(manifest.get("workspace_subpath") or "").strip()
+                    if ws_subpath:
+                        inst = factory(eng, tool_registry, workspace_path=base_state / ws_subpath)
+                    else:
+                        inst = _invoke_provider_factory(
+                            factory,
+                            capability_engine=eng,
+                            tool_registry=tool_registry,
+                            state_root=base_state,
+                        )
+                    if inst is None:
+                        continue
+
+                    self._register_if_provider(
+                        eng,
+                        pid,
+                        inst,
+                        tool_registry=tool_registry,
+                        allow_auto_activate=allow_auto_activate,
+                        actor=actor,
+                    )
+                    c.attached_providers[pid] = inst
+                    detach_spec = str(manifest.get("detach") or "").strip()
+                    if detach_spec:
+                        self._provider_detach_hooks[pid] = _load_dotted_symbol(detach_spec)
+                    mod_label = f"plugin:{pid}"
+                    if mod_label not in c.discovered_modules:
+                        c.discovered_modules.append(mod_label)
+                except Exception as exc:
+                    c.provider_errors[pid] = f"{type(exc).__name__}: {exc}"
+
+    def attach_capability_providers(
+        self,
+        capability_engine: Optional[Any] = None,
+        *,
+        tool_registry: Optional[Any] = None,
+        state_root: Optional[Path] = None,
+        transcriber: Optional[Any] = None,
+        allow_auto_activate: bool = False,
+        actor: str = "owner",
+    ) -> Dict[str, Any]:
+        """
+        Auto-discover and attach standalone CapabilityProviders (`sensa`, zero-pip drop-in
+        `plugins/*/lila_plugin.json` packages, `lila.capability_providers` entry points, and
+        registered custom factories) with per-provider error isolation.
+        """
+        eng = capability_engine or self.components.capability_engine
+        if eng is None:
+            return {}
+        if self.components.capability_engine is None:
+            self.components.capability_engine = eng
+
+        c = self.components
+        base_state = Path(state_root) if state_root is not None else (Path.home() / ".local" / "share" / "lila")
+
+        # 1. Optional Sensa Media Intelligence provider
+        if "sensa" not in c.attached_providers:
+            if not _is_env_disabled("LILA_SENSA_ENABLED", default_enabled=True):
+                try:
+                    from src.harness.media_adapter import attach_sensa_provider
+                    sensa_provider, reg = attach_sensa_provider(
+                        eng.providers,
+                        tool_registry=tool_registry,
+                        transcriber=transcriber,
+                        allow_auto_activate=allow_auto_activate,
+                        actor=actor,
+                    )
+                    c.attached_providers["sensa"] = sensa_provider
+                    c.provider_registrations["sensa"] = reg
+                    if "lila-sensa" not in c.discovered_modules:
+                        c.discovered_modules.append("lila-sensa")
+                except Exception as exc:
+                    c.provider_errors["sensa"] = f"{type(exc).__name__}: {exc}"
+
+        # 2. Zero-pip drop-in `plugins/<name>/lila_plugin.json` folders
+        self._attach_drop_in_plugins(
+            eng,
+            tool_registry=tool_registry,
+            base_state=base_state,
+            allow_auto_activate=allow_auto_activate,
+            actor=actor,
+        )
+
+        # 3. Installed Python entry points (`lila.capability_providers`)
+        try:
+            eps = importlib.metadata.entry_points(group="lila.capability_providers")
+        except Exception:
+            eps = ()
+        for ep in eps:
+            ep_name = str(getattr(ep, "name", "") or "entry_point").strip()
+            if ep_name in c.attached_providers:
+                continue
+            try:
+                loaded = ep.load()
+                inst = _invoke_provider_factory(
+                    loaded,
+                    capability_engine=eng,
+                    tool_registry=tool_registry,
+                    state_root=base_state,
+                )
+                self._register_if_provider(
+                    eng,
+                    ep_name,
+                    inst,
+                    tool_registry=tool_registry,
+                    allow_auto_activate=allow_auto_activate,
+                    actor=actor,
+                )
+            except Exception as exc:
+                c.provider_errors[ep_name] = f"{type(exc).__name__}: {exc}"
+
+        # 4. Caller-registered custom provider factories
+        for name, factory in self._provider_factories.items():
+            if name in c.attached_providers:
+                continue
+            try:
+                inst = _invoke_provider_factory(
+                    factory,
+                    capability_engine=eng,
+                    tool_registry=tool_registry,
+                    state_root=base_state,
+                )
+                self._register_if_provider(
+                    eng,
+                    name,
+                    inst,
+                    tool_registry=tool_registry,
+                    allow_auto_activate=allow_auto_activate,
+                    actor=actor,
+                )
+            except Exception as exc:
+                c.provider_errors[name] = f"{type(exc).__name__}: {exc}"
+
+        return dict(c.attached_providers)
+
+    def get_provider(self, provider_id: str) -> Optional[Any]:
+        """Return an attached CapabilityProvider by ID, if present."""
+        return self.components.attached_providers.get(provider_id)
+
+    def detach_all_providers(
+        self,
+        capability_engine: Optional[Any] = None,
+        *,
+        session_ids: Sequence[str] = ("default",),
+        actor: str = "owner",
+    ) -> List[str]:
+        """Detach and close every attached CapabilityProvider cleanly."""
+        eng = capability_engine or self.components.capability_engine
+        c = self.components
+        detached: List[str] = []
+
+        for pid, provider in list(c.attached_providers.items()):
+            try:
+                hook = self._provider_detach_hooks.pop(pid, None)
+                if eng is not None:
+                    if callable(hook):
+                        hook(eng)
+                    else:
+                        eng.providers.unregister_provider(pid, session_ids=session_ids, actor=actor)
+            except Exception:
+                pass
+            finally:
+                close_fn = getattr(provider, "close", None)
+                if callable(close_fn):
+                    try:
+                        close_fn()
+                    except Exception:
+                        pass
+            detached.append(pid)
+
+        c.attached_providers.clear()
+        c.provider_registrations.clear()
+        self._provider_detach_hooks.clear()
+        return detached
+
     def status(self) -> Dict[str, Any]:
-        """Return a summary of all plugged-in TicketLabs modules, remote links, and microcontroller nodes."""
+        """Return a summary of all plugged-in TicketLabs modules, providers, remote links, and edge nodes."""
         c = self.components
         remote_ok = self.remote_client.is_reachable() if self.remote_client is not None else False
         return {
             "discovered_modules": list(c.discovered_modules),
+            "attached_providers": sorted(c.attached_providers.keys()),
+            "provider_errors": dict(c.provider_errors),
+            "plugin_dirs": [str(d) for d in _discover_plugin_dirs(self.plugin_dirs)],
             "asi_loaded": c.asi_runtime is not None,
             "asi_label": getattr(c.asi_runtime, "runtime_label", None),
             "remote_url": self.remote_url,
@@ -399,22 +778,23 @@ class LilaHub:
             ),
             "vtalks_available": c.voice_transcriber is not None,
             "oia_available": c.owner_auth_service is not None,
+            "sensa_available": c.sensa_cls is not None,
             "registered_tools_count": len(self._tools),
             "edge_nodes": list(self.edge_nodes.keys()),
         }
 
     def build_system_prompt(self, base_system: str, user_message: str = "") -> str:
-        """If lila-capability-engine is plugged in, automatically assist-match and append compact capability index."""
+        """If lila-capability-engine is plugged in, automatically assist-match and append capability context."""
         c = self.components
         if c.core_capability_adapter is None:
             return base_system
-        block = c.core_capability_adapter.build_turn_capability_context(
+        messages, _ = c.core_capability_adapter.build_turn_messages(
             session_id=self.session_id,
-            user_query=user_message,
+            static_prefix=base_system,
+            user_text=user_message,
+            canonical_history=(),
         )
-        if not block:
-            return base_system
-        return f"{base_system.rstrip()}\n\n{block}"
+        return str(messages[0].get("content", base_system))
 
     def chat(
         self,
@@ -463,6 +843,8 @@ class LilaHub:
         return reply
 
     def close(self) -> None:
+        if self.components.attached_providers:
+            self.detach_all_providers(self.components.capability_engine)
         if self.components.asi_runtime is not None:
             self.components.asi_runtime.close()
             self.components.asi_runtime = None

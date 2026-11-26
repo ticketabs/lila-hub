@@ -3,7 +3,9 @@ lila_hub — The Open-Source Connector Board & Universal Device Mesh for TicketL
 
 Supports 3 Operating Modes out of the box:
   1. Mode 1 (On-Device Local): Snaps together installed TicketLabs packages (`lila-asi`,
-     `lila-capability-engine`, `lila-vtalks`, `lila-oia`) on the current machine/phone.
+     `lila-capability-engine`, `lila-vtalks`, `lila-oia`, `lila-sensa`), zero-pip drop-in
+     folders under `plugins/` with a `lila_plugin.json` manifest, and Python entry points
+     under `lila.capability_providers`.
   2. Mode 2 (Remote Island / Universal Client): Connects any phone, laptop, or script
      remotely to a running LilaDaemon or LilaHub server anywhere (LAN, Wi-Fi, Tailscale/VPN)
      with automatic failover to Mode 1 if offline.

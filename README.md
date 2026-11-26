@@ -1,18 +1,20 @@
 # Lila Hub (`lila-hub`) — Plug-and-Play Connector Board for TicketLabs Standalones
 
-`lila-hub` is the open-source connector board that lets anyone snap together any combination of TicketLabs standalone packages (`lila-asi`, `lila-capability-engine`, `lila-vtalks`, `lila-oia`, or their own `llama.cpp` / OpenAI backend) into one runtime.
+`lila-hub` is the open-source connector board that lets anyone snap together any combination of TicketLabs standalone packages (`lila-asi`, `lila-capability-engine`, `lila-vtalks`, `lila-oia`, `lila-sensa`, or their own `llama.cpp` / OpenAI backend) plus drop-in `plugins/` and entry-point extensions into one runtime.
 
 ## How It Works
 
-Each TicketLabs package works 100% standalone. When you install two or more of them in the same Python environment and run `LilaHub.connect()`, `lila-hub` automatically discovers which modules are installed and wires their bridges together:
+Each TicketLabs package works 100% standalone. When you place them together or run `LilaHub.connect()` + `hub.attach_capability_providers(...)`, `lila-hub` automatically discovers which modules and plugins exist and wires their bridges together:
 
 1. **`lila-capability-engine` + `lila-asi` (or `custom_llm_fn`):**
    - Automatically matches user queries to active `CapabilityBundle`s and injects the compact capability index + active tool schemas into the system prompt.
    - Feeds active tools directly into `AsiRuntime(..., active_tools=...)` so **E05 v2 Grammar-Aware Sparse `lm_head`** hardware-locks valid `<tool_call>` JSON.
-2. **`lila-vtalks`:**
-   - Exposes `ParakeetTranscriber` on `hub.components.voice_transcriber` when installed.
-3. **`lila-oia`:**
-   - Exposes `OwnerAuthenticationService` and `OwnerProfileStore` on `hub.components.owner_auth_service` when installed.
+2. **`lila-vtalks` & `lila-oia` & `lila-sensa`:**
+   - Exposes `ParakeetTranscriber`, `OwnerAuthenticationService`/`OwnerProfileStore`, and `Sensa` media workflows automatically when present.
+3. **Zero-`pip` Drop-In `plugins/` Scanning:**
+   - Drop any plugin folder under `plugins/<name>/` with a `lila_plugin.json` manifest (`{"provider_id": "...", "factory": "module:callable"}`) and `LilaHub` loads it automatically with no `pip install` needed.
+4. **Python Entry Points (`lila.capability_providers`):**
+   - Pip-installed packages advertising `lila.capability_providers` entry points are also auto-attached cleanly with per-plugin error isolation.
 
 ## Quickstart (3 Lines to Connect Everything Installed)
 

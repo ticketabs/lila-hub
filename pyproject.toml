@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "lila-hub"
 version = "1.0.0"
-description = "Plug-and-Play Connector Board for TicketLabs Standalone Packages (lila-asi, lila-capability-engine, lila-vtalks, lila-oia)"
+description = "Plug-and-Play Connector Board for TicketLabs Standalone Packages (lila-asi, lila-capability-engine, lila-vtalks, lila-oia, lila-sensa)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "AGPL-3.0-only"}
